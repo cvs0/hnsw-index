@@ -1,0 +1,17 @@
+build/
+data/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+.cache/
+__pycache__/
+.venv/
+*.pyc
+*.fvecs
+*.ivecs
+*.hdf5
+*.bin
+*.o
+*.a
+*.so
