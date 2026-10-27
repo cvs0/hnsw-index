@@ -4,10 +4,10 @@ C++20 HNSW approximate nearest-neighbor index (Malkov and Yashunin, IEEE TPAMI 4
 
 ## Graph
 
-Layer 0 contains every point. Its degree cap is `M0 = 2M`.
-Layer `l > 0` contains points whose level is at least `l`. Its degree cap is `M`.
+Layer 0 contains every live point and every tombstone. Its degree cap is `M0 = 2M`.
+Layer `l > 0` contains occupants whose level is at least `l`. Its degree cap is `M`.
 Insertion writes the forward edges, then a reverse edge at each selected neighbor. Reverse insertion reruns the same prune, so adjacency is not symmetric.
-The entry point is a point on the current top layer. A new point replaces it only when its level is strictly greater. Equal levels keep the earlier point.
+The entry point is an occupant of the current top layer. A new point replaces it only when its level is strictly greater. Equal levels keep the earlier point. Erase replaces it when that occupant is removed or the top layer loses every point. The replacement is an occupant of the new top layer, taken from the deleted node's former neighbors when one of them has that level. A tombstone still counts as an occupant.
 
 ## Layer assignment
 
@@ -49,7 +49,9 @@ Vectors sit in chunks of 1024. `aligned_alloc(32, 1024 * dim * 4)` gives the bas
 
 Nodes live in blocks of 256 and are never moved. Each node holds a `std::mutex`, its level, and pointers into a bump arena of `atomic<uint32_t>` (chunks of 65536). A node at level `L` owns `L + 1` seqlock counters, `L + 1` degrees, and `M0 + L * M` neighbor slots.
 
-Id-to-node tables start at 32 pointers and id-to-chunk tables start at 4. Both double. Old tables are retained until destruction, so a published address stays valid. The `Node*` is release-stored after initialization. `n_` is release-stored after the ready flag and the node pointer.
+Id-to-node tables start at 32 pointers and id-to-chunk tables start at 4. Both double. Old tables are retained until destruction, so a published address stays valid. The `Node*` is release-stored after initialization. `n_` is release-stored after the ready flag and the node pointer when the id is fresh.
+
+`size()` is the live count. `slot_count()` is `n_`, the high-water mark. Each node has an `atomic` slot state (`Empty`, `Live`, `Tombstone`, `Free`), a generation, and one inbound `std::vector<uint32_t>` per layer. Forward-list writers hold `graph_mu_`, and search does not read inbound lists. In-degree is uncapped. `memory_bytes()` sums vector chunks, the neighbor arena, node blocks, pointer tables, and inbound capacity. Erase does not return a chunk or an arena slice. The id goes on a freelist. The next insert reuses the node and its neighbor slots. Level is a function of `(seed, id)`, so the reused id keeps its level. `adopt_slot` throws if the stored level disagrees.
 
 ## SIMD distance kernels
 
@@ -59,40 +61,47 @@ The AVX2 body keeps four YMM accumulators, steps 32 floats, then 8, then a scala
 
 ## Concurrency
 
-`insert` holds the allocator mutex across id allocation, chunk and node growth, `memcpy`, cosine normalization, the ready release, node initialization, and the `n_` release. Graph linking runs after that unlock.
+`insert` holds the allocator mutex across id allocation, the freelist pop, chunk and node growth, `memcpy`, cosine normalization, the ready release, node initialization, the live-count increment, and the `n_` release for a fresh id. The first occupant (`max_level < 0`) stores the entry and `max_level`, sets ready, and returns without linking. Every later insert links after that unlock.
 
-Id 0 stores the entry point, `max_level`, and the ready flag, then the `n_` release, and returns without linking. Other inserters spin until ready.
+`link_node`, `erase`, and `tombstone` hold `graph_mu_` for the whole structural edit. Concurrent inserts serialize there. Search does not take `graph_mu_`. Search is safe alongside insert, erase, tombstone, and other searches.
 
-Entry promotion takes `entry_mu_` when `level > max_level`, stores the entry relaxed, then stores `max_level` with release. Search loads `max_level` with acquire, then the entry relaxed.
+Entry promotion runs under `graph_mu_` and takes `entry_mu_` when `level > max_level`. It stores the entry relaxed, then `max_level` with release. Search loads `max_level` with acquire and the entry with acquire. Erase can replace the entry without changing `max_level`.
 
 Each node mutex serializes writers of that node. Search does not take it. Neighbor lists are copied under a seqlock. The writer stores `seq = s + 1` relaxed, a release fence, the degree and slots relaxed, a release fence, then `seq = s + 2` with release. The odd value is the update window. The reader loads `seq` with acquire, spins while it is odd, copies degree and slots relaxed, an acquire fence, reloads `seq` relaxed, and retries unless the two sequence values match.
 
-A thread holds at most one node mutex.
+A thread holds at most one node mutex. It does not take the allocator mutex while holding `graph_mu_`. Erase drops `graph_mu_` before the reclaim mutex. Insert takes the allocator mutex, then the reclaim mutex.
+
+Search publishes an epoch pin before it reads the graph. The pin stores the epoch clock and retries if the clock moved. `erase` records that clock, increments it, and moves the id to the freelist only after every active pin is strictly greater than the recorded epoch. A pin value of 0 means the slot is idle. There are 4096 pin slots. A freed id is not overwritten while a search that pinned before the unlink is still in `search`.
 
 `insert_batch` with `threads == 1` assigns ids in row order. With `threads > 1`, ids follow allocator-lock order, not row order. The SIFT numbers below use `threads = 1`, so ids match the ground-truth file.
 
-`save`, `load`, and destruction require exclusive access. `save` is not atomic with a concurrent insert. Search is safe alongside insert and other searches.
+`save`, `load`, and destruction require exclusive access. `save` is not atomic with a concurrent insert.
 
-Visited generation tags and both heaps are `thread_local`. On token wrap the tag array is cleared.
+Visited generation tags and both heaps are `thread_local`. On token wrap the tag array is cleared. `link_node` captures the node generation under `graph_mu_` and returns without writing edges if `erase` has already bumped it.
 
 ## On-disk format
 
-Little-endian. Magic `HNSW0001`, version `u32 = 1`.
+Little-endian. Magic `HNSW0001`. `save` writes version `u32 = 2`. `load` still accepts version 1.
+
+Version 1 is dense. Its count field is `n`, every id in `[0, n)` is live, and there is no flag array.
+
+Version 2 stores the high-water mark and a hole map.
 
 | Field | Type |
 | --- | --- |
 | magic | 8 bytes |
-| version | u32 |
+| version | u32, `2` |
 | dim, metric, M, M0, ef_construction | u32 |
 | seed | u64 |
-| count | u32 |
-| max_level | i32, `-1` when empty |
-| entry_point | u32 |
-| vectors | f32[count * dim], stored form (cosine already normalized) |
-| levels | u32[count] |
-| links | for each id, for layer `0 .. level`: u32 degree, then that many u32 neighbor ids |
+| high-water | u32 |
+| max_level | i32, `-1` when no occupant remains |
+| entry_point | u32, `0` when empty |
+| flags | u8[high-water], `0` free, `1` live, `2` tombstone |
+| vectors | f32[dim] for each occupied id, ascending id, stored form |
+| levels | u32 per occupied id, same order |
+| links | for each occupied id, for layer `0 .. level`: u32 degree, then that many u32 neighbor ids |
 
-Load rejects a file unless `M0 == 2M`, the entry id is in range, the entry level equals `max_level` and equals the maximum stored level, every degree is within the layer cap, and every neighbor id is `< count` and not the node itself. A little-endian host bulk-copies the floats. Any other host writes each float as its `u32` bit pattern.
+Load rejects a file unless `M0 == 2M`, levels are in `[0, 16]`, the entry level equals `max_level` and equals the maximum stored level, every degree is within the layer cap, and every neighbor id is below the high-water mark, is not the node itself, and has level at least the layer. An empty file must have `max_level == -1` and `entry == 0`. Free ids are pushed on the freelist with no epoch wait. A little-endian host bulk-copies the floats. Any other host writes each float as its `u32` bit pattern.
 
 ## Build and run
 
@@ -127,6 +136,17 @@ python3 bench/compare_faiss.py \
   --efs 10,20,40,80,160,320
 ```
 
+```
+./build/hnsw_delete_bench \
+  --base data/sift/sift_base.fvecs \
+  --query data/sift/sift_query.fvecs \
+  --M 16 --ef-construction 200 --k 10 \
+  --efs 10,40,160 --fractions 0.1,0.3,0.5 --churn 0.1 \
+  --max-n 20000 --max-q 1000 --seed 1 \
+  --csv bench/results/delete.csv \
+  --meta bench/results/delete_meta.txt
+```
+
 `fetch_sift.sh` tries the TEXMEX tarball, then `sift-128-euclidean.hdf5` from ann-benchmarks. The measured files came from that HDF5 fallback. Python packages for the comparison: `numpy`, `faiss-cpu`, `matplotlib`. `h5py` is used only by the HDF5 conversion. Datasets are gitignored.
 
 ```cpp
@@ -144,7 +164,27 @@ const float query[] = {0.1f, 0.9f};
 const std::vector<hnsw::Neighbor> hits = index.search(query, 1, 16);
 ```
 
-`Neighbor::distance` is the minimized value from the metric table. `BruteForce` is an exact scan with the same metric and the same sort order. It is not safe for concurrent `add` and `search`.
+`Neighbor::distance` is the minimized value from the metric table. `BruteForce` is an exact scan with the same metric and the same sort order. `BruteForce::erase` marks the slot dead and does not move later ids. `size()` is the live count. It is not safe for concurrent `add` and `search`.
+
+## Deletion
+
+`erase` accepts a live id or a tombstone. It holds `graph_mu_` until the graph is repaired.
+
+It snapshots the out-neighbors and the in-neighbors on every layer the node occupies, adds one to the generation, and stores `Free`. A live id decrements `size()`. `level_count[level]` decrements for both. From the node's level down to layer 0 it clears that node's forward list, then walks the snapshotted in-neighbors. Each in-neighbor drops the deleted id. A non-live in-neighbor keeps the rest of its list and is not re-selected. A live in-neighbor `u` builds a candidate bag from three sets, plus a local search: its remaining forward list, the deleted node's out-neighbors on that layer, the deleted node's in-neighbors on that layer, and `search_layer` from `u` with width `ef_construction`. The bag drops `u`, the deleted id, and any id that is not live. `select_from` is Algorithm 4 with the layer cap. `write_links` publishes that list and updates inbound records.
+
+`level_count` includes tombstones. The new top layer is the highest bin that is still non-zero. If every bin is zero, `max_level` becomes `-1`, the entry becomes `0`, and ready is cleared, so the next insert is a fresh entry point. Otherwise the current entry is kept when it still occupies that layer. If it does not, the replacement is the first former neighbor of the deleted node that occupies the new top layer, or a scan of `[0, slot_count())` if none does.
+
+After `graph_mu_` is released the id is retired under the epoch rule in Concurrency. The freelist hands it to a later `insert`. The neighbor arena slice is reused with the id.
+
+## Tombstones
+
+`tombstone` stores `Tombstone`, decrements the live count, and leaves the vector and the edges in place. `level_count` does not change, so the point can remain the entry. The slot is not reused. Search pushes a tombstone onto the candidate heap and does not admit it to the result beam, so a tombstone does not consume `ef`. Returned ids are live.
+
+The vector chunk, the neighbor slots, and the inbound lists stay allocated. `slot_count()` does not shrink. The next insert of a distinct vector takes a fresh id, so delete/insert churn grows the high-water mark by one slot per insert. Search still evaluates a distance for every tombstone it visits, and live lists still name deleted ids. The neighbor heuristic is not rerun on the surviving graph.
+
+FAISS HNSW does not implement `remove_ids`. On facebookresearch/faiss#3339 the maintainer wrote that HNSW does not support `remove_ids`, because the graph has to be re-linked after nodes are removed.
+
+A filter applied only after the beam is full would spend `ef` on dead hits and cut recall. This tombstone path does not do that. In the measurements below, tombstone recall stays above erase recall, and tombstone QPS falls as the dead fraction grows. Slot reuse is the part a tombstone does not do.
 
 ## Benchmark
 
@@ -168,3 +208,73 @@ Build time: this index 468.656 s, FAISS 355.850 s. One run. Cosine and inner pro
 ![recall@10 versus queries/sec](bench/results/recall_qps.png)
 
 CSV: `bench/results/results.csv`.
+
+### Deletion on a SIFT prefix
+
+Same machine and compiler as the SIFT1M run. AVX2 kernel selected. `delete_meta.txt` records `cpu_model Intel(R) Xeon(R) Processor`, `MemTotal: 16387280 kB`, compiler `13.3.0`, `avx2 1`.
+
+Prefix of `sift_base.fvecs`, `n = 20000`, first `nq = 1000` queries, dim 128, L2. `M = 16`, `M0 = 32`, `ef_construction = 200`, `k = 10`, `seed = 1`, one thread. The deleted ids are a `std::mt19937` shuffle of `[0, n)` seeded with `1`. Fraction `f` removes the first `floor(f * n)` ids of that permutation: 2000, 6000, and 10000. Churn is 2000 steps. Each step removes `order[i]` and inserts `base[n + i]`.
+
+Three strategies, each on a fresh build. `erase` calls `Index::erase`. `tombstone` calls `Index::tombstone`. `rebuild` for a fraction builds one index from the survivors in increasing original-id order. `rebuild` for churn builds one index from those survivors followed by the 2000 inserted vectors. It is one construction, not a rebuild per step. Rebuild ids are that insertion order. Ground truth is an exact squared-L2 top 10 over the same ids, closer first, then smaller id.
+
+`op_seconds` times only the deletes, the churn loop, or the rebuild `insert_batch`. Each `ef` has one untimed query pass and one timed pass. QPS is `nq / elapsed`. `memory_bytes` is `Index::memory_bytes` after the mutation. Process RSS is not in the table. It includes the mapped fvecs and pages the allocator has not returned, and it climbs across rows inside one process. One run.
+
+| phase | fraction | strategy | ef | recall@10 | QPS |
+| --- | ---: | --- | ---: | ---: | ---: |
+| delete | 0.1 | erase | 10 | 0.828200 | 83903.098 |
+| delete | 0.1 | erase | 40 | 0.985600 | 28787.031 |
+| delete | 0.1 | erase | 160 | 0.999800 | 8490.015 |
+| delete | 0.1 | tombstone | 10 | 0.864500 | 66024.783 |
+| delete | 0.1 | tombstone | 40 | 0.991400 | 22544.899 |
+| delete | 0.1 | tombstone | 160 | 0.999900 | 6861.636 |
+| delete | 0.1 | rebuild | 10 | 0.857800 | 74140.191 |
+| delete | 0.1 | rebuild | 40 | 0.990300 | 25264.820 |
+| delete | 0.1 | rebuild | 160 | 0.999900 | 7638.902 |
+| delete | 0.3 | erase | 10 | 0.832700 | 86427.383 |
+| delete | 0.3 | erase | 40 | 0.985200 | 29106.836 |
+| delete | 0.3 | erase | 160 | 0.999800 | 8707.607 |
+| delete | 0.3 | tombstone | 10 | 0.890900 | 51950.033 |
+| delete | 0.3 | tombstone | 40 | 0.994600 | 17811.244 |
+| delete | 0.3 | tombstone | 160 | 0.999900 | 5499.602 |
+| delete | 0.3 | rebuild | 10 | 0.868200 | 81907.910 |
+| delete | 0.3 | rebuild | 40 | 0.991600 | 27360.158 |
+| delete | 0.3 | rebuild | 160 | 0.999900 | 8288.975 |
+| delete | 0.5 | erase | 10 | 0.839700 | 91269.373 |
+| delete | 0.5 | erase | 40 | 0.986700 | 30502.679 |
+| delete | 0.5 | erase | 160 | 0.999800 | 9146.893 |
+| delete | 0.5 | tombstone | 10 | 0.920200 | 37884.516 |
+| delete | 0.5 | tombstone | 40 | 0.997300 | 12899.348 |
+| delete | 0.5 | tombstone | 160 | 0.999900 | 3979.760 |
+| delete | 0.5 | rebuild | 10 | 0.878800 | 92002.795 |
+| delete | 0.5 | rebuild | 40 | 0.993600 | 30853.907 |
+| delete | 0.5 | rebuild | 160 | 0.999800 | 9354.645 |
+| churn | 0.1 | erase | 10 | 0.830800 | 79730.327 |
+| churn | 0.1 | erase | 40 | 0.985600 | 27119.019 |
+| churn | 0.1 | erase | 160 | 0.999600 | 8028.923 |
+| churn | 0.1 | tombstone | 10 | 0.858300 | 63559.905 |
+| churn | 0.1 | tombstone | 40 | 0.989900 | 21888.186 |
+| churn | 0.1 | tombstone | 160 | 0.999800 | 6097.509 |
+| churn | 0.1 | rebuild | 10 | 0.854500 | 70350.698 |
+| churn | 0.1 | rebuild | 40 | 0.988800 | 24256.903 |
+| churn | 0.1 | rebuild | 160 | 0.999700 | 7338.742 |
+
+| phase | fraction | strategy | op_seconds | op_count | memory_bytes | n_live | n_slots |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| delete | 0.1 | erase | 5.168310 | 2000 | 18420840 | 18000 | 20000 |
+| delete | 0.1 | tombstone | 0.000049 | 2000 | 18335552 | 18000 | 20000 |
+| delete | 0.1 | rebuild | 2.503989 | 2000 | 16566200 | 18000 | 18000 |
+| delete | 0.3 | erase | 13.526486 | 6000 | 18453832 | 14000 | 20000 |
+| delete | 0.3 | tombstone | 0.000107 | 6000 | 18335552 | 14000 | 20000 |
+| delete | 0.3 | rebuild | 1.799663 | 6000 | 12777664 | 14000 | 14000 |
+| delete | 0.5 | erase | 21.315574 | 10000 | 18475496 | 10000 | 20000 |
+| delete | 0.5 | tombstone | 0.000161 | 10000 | 18335552 | 10000 | 20000 |
+| delete | 0.5 | rebuild | 1.175314 | 10000 | 9277976 | 10000 | 10000 |
+| churn | 0.1 | erase | 5.804187 | 4000 | 18475048 | 20000 | 20000 |
+| churn | 0.1 | tombstone | 0.418575 | 4000 | 20098632 | 20000 | 22000 |
+| churn | 0.1 | rebuild | 2.900171 | 4000 | 18354760 | 20000 | 20000 |
+
+Erase latency per id is `op_seconds / op_count` on the delete rows: 2.584 ms, 2.254 ms, and 2.132 ms. Each live in-neighbor runs `search_layer` at `ef_construction` while `graph_mu_` is held. Tombstone latency is the state store. At fraction 0.5 and `ef = 10`, tombstone QPS is 37884.516 against 91269.373 for erase and 92002.795 for rebuild. After the pure deletes, erase `memory_bytes` stays on the 20000-slot allocation. Rebuild `memory_bytes` follows the live count. After churn, erase `n_slots` is 20000 and tombstone `n_slots` is 22000.
+
+At `ef = 10`, erase recall is below a rebuilt graph (0.828200 against 0.857800 at fraction 0.1, 0.839700 against 0.878800 at fraction 0.5). At `ef = 160` the three strategies sit between 0.999600 and 0.999900. Tombstone recall is the highest of the three at `ef = 10` because dead nodes stay on the candidate heap and do not take result slots.
+
+CSV: `bench/results/delete.csv`.

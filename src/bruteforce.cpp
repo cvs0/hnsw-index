@@ -30,6 +30,8 @@ struct BruteForce::Impl {
   Metric metric_ = Metric::L2;
   DistanceFunction dist_ = nullptr;
   std::vector<float> data_;
+  std::vector<char> dead_;
+  std::size_t live_ = 0;
 
   Impl(std::size_t dim, Metric metric) : dim_(dim), metric_(metric) {
     if (dim_ == 0 || dim_ > 65536) throw std::invalid_argument("hnsw: dim must be in [1, 65536]");
@@ -45,15 +47,24 @@ struct BruteForce::Impl {
     data_.insert(data_.end(), vector, vector + dim_);
     if (metric_ == Metric::Cosine)
       l2_normalize(data_.data() + static_cast<std::size_t>(id) * dim_, dim_);
+    dead_.push_back(0);
+    ++live_;
     return id;
+  }
+
+  void erase(std::uint32_t id) {
+    const std::size_t n = data_.size() / dim_;
+    if (id >= n || dead_[id]) throw std::out_of_range("hnsw: id");
+    dead_[id] = 1;
+    --live_;
   }
 
   std::vector<Neighbor> search(const float* query, std::size_t k) const {
     if (k == 0) return {};
     if (query == nullptr) throw std::invalid_argument("hnsw: null query");
     const std::size_t n = data_.size() / dim_;
-    if (n == 0) return {};
-    if (k > n) k = n;
+    if (live_ == 0) return {};
+    if (k > live_) k = live_;
 
     std::vector<float> qstorage;
     const float* q = query;
@@ -65,6 +76,7 @@ struct BruteForce::Impl {
 
     std::priority_queue<Neighbor, std::vector<Neighbor>, BetterThanWorst> heap;
     for (std::size_t id = 0; id < n; ++id) {
+      if (dead_[id]) continue;
       Neighbor nb{static_cast<std::uint32_t>(id), dist_(q, data_.data() + id * dim_, dim_)};
       if (heap.size() < k) {
         heap.push(nb);
@@ -94,13 +106,16 @@ std::size_t BruteForce::dim() const {
   return impl_->dim_;
 }
 std::size_t BruteForce::size() const {
-  return impl_->data_.size() / impl_->dim_;
+  return impl_->live_;
 }
 Metric BruteForce::metric() const {
   return impl_->metric_;
 }
 std::uint32_t BruteForce::add(const float* vector) {
   return impl_->add(vector);
+}
+void BruteForce::erase(std::uint32_t id) {
+  impl_->erase(id);
 }
 void BruteForce::add_batch(const float* vectors, std::size_t count) {
   if (count == 0) return;

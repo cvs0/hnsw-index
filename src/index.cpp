@@ -26,7 +26,10 @@ constexpr std::uint32_t kChunkShift = 10;
 constexpr std::uint32_t kChunkSize = 1u << kChunkShift;
 constexpr std::uint32_t kChunkMask = kChunkSize - 1;
 constexpr char kMagic[8] = {'H', 'N', 'S', 'W', '0', '0', '0', '1'};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersionDense = 1;
+constexpr std::uint32_t kVersionSlots = 2;
+
+enum class SlotState : std::uint8_t { Empty = 0, Live = 1, Tombstone = 2, Free = 3 };
 
 struct Candidate {
   float dist = 0.f;
@@ -202,10 +205,15 @@ struct Node {
 
   std::mutex mu;
   int level = 0;
+  int slot_level = -1;
+  std::atomic<SlotState> state{SlotState::Empty};
+  std::atomic<std::uint32_t> gen{0};
   // seq[layer] is even when the layer's neighbor list is stable.
   std::atomic<std::uint32_t>* seq = nullptr;
   std::atomic<std::uint32_t>* degree = nullptr;
   std::atomic<std::uint32_t>* slots = nullptr;
+  // inbound[layer] lists nodes whose forward list at that layer contains this id.
+  std::vector<std::vector<std::uint32_t>> inbound;
 };
 
 struct NodeBlock {
@@ -264,6 +272,12 @@ struct Arena {
     c.used += n;
     return p;
   }
+
+  std::size_t bytes() const {
+    std::size_t n = 0;
+    for (const Chunk& c : chunks) n += c.cap * sizeof(std::atomic<std::uint32_t>);
+    return n;
+  }
 };
 
 bool improves(float d, std::uint32_t id, const Candidate& worst) {
@@ -286,11 +300,25 @@ struct Index::Impl {
   DistanceFunction dist_ = nullptr;
 
   std::atomic<std::uint32_t> n_{0};
+  std::atomic<std::uint32_t> live_{0};
+  std::atomic<std::uint32_t> level_count_[kMaxLevel + 1]{};
   std::atomic<int> max_level_{-1};
   std::atomic<std::uint32_t> entry_{0};
   std::atomic<bool> ready_{false};
   std::mutex alloc_mu_;
+  std::mutex graph_mu_;
   std::mutex entry_mu_;
+  std::mutex reclaim_mu_;
+  std::vector<std::uint32_t> freelist_;
+  struct Retired {
+    std::uint32_t id = 0;
+    std::uint64_t epoch = 0;
+  };
+  std::vector<Retired> retired_;
+  mutable std::atomic<std::uint64_t> epoch_clock_{1};
+  static constexpr int kMaxPins = 4096;
+  mutable std::atomic<std::uint64_t> pins_[kMaxPins];
+  mutable std::atomic<int> pin_used_{0};
 
   Arena arena_;
   std::vector<std::unique_ptr<NodeBlock>> blocks_;
@@ -322,6 +350,7 @@ struct Index::Impl {
     node_table_.store(node_tables_.back().get(), std::memory_order_relaxed);
     vec_tables_.push_back(VecTable::make(4));
     vec_table_.store(vec_tables_.back().get(), std::memory_order_relaxed);
+    for (std::atomic<std::uint64_t>& pin : pins_) pin.store(0, std::memory_order_relaxed);
   }
 
   int level_for(std::uint32_t id) const {
@@ -420,15 +449,139 @@ struct Index::Impl {
     throw std::logic_error("hnsw: missing node");
   }
 
-  Node* init_node(std::uint32_t id, int level) {
-    Node* node =
-        &blocks_[static_cast<std::size_t>(id) / NodeBlock::kSize]->nodes[id % NodeBlock::kSize];
+  Node* node_at(std::uint32_t id) const {
+    return &blocks_[static_cast<std::size_t>(id) / NodeBlock::kSize]->nodes[id % NodeBlock::kSize];
+  }
+
+  // Level is a function of id, so a reused slot keeps the arrays from its first adopt.
+  std::uint32_t adopt_slot(std::uint32_t id, int level) {
+    Node* node = node_at(id);
+    if (node->slots == nullptr) {
+      const std::size_t nlayers = static_cast<std::size_t>(level) + 1;
+      node->seq = arena_.alloc(nlayers);
+      node->degree = arena_.alloc(nlayers);
+      node->slots = arena_.alloc(M0_ + static_cast<std::size_t>(level) * M_);
+      node->slot_level = level;
+      node->inbound.assign(nlayers, {});
+      node->gen.store(1, std::memory_order_relaxed);
+    } else {
+      if (node->slot_level != level) throw std::logic_error("hnsw: slot level changed");
+      for (auto& in : node->inbound) in.clear();
+      node->gen.fetch_add(1, std::memory_order_relaxed);
+    }
     node->level = level;
-    const std::size_t nlayers = static_cast<std::size_t>(level) + 1;
-    node->seq = arena_.alloc(nlayers);
-    node->degree = arena_.alloc(nlayers);
-    node->slots = arena_.alloc(M0_ + static_cast<std::size_t>(level) * M_);
-    return node;
+    for (int layer = 0; layer <= level; ++layer) {
+      node->degree[layer].store(0, std::memory_order_relaxed);
+      node->seq[layer].store(0, std::memory_order_relaxed);
+    }
+    return node->gen.load(std::memory_order_relaxed);
+  }
+
+  Node* peek_node(std::uint32_t id) const {
+    NodeTable* table = node_table_.load(std::memory_order_acquire);
+    if (table == nullptr || id >= table->cap) return nullptr;
+    return table->slots[id].load(std::memory_order_acquire);
+  }
+
+  SlotState state_of(std::uint32_t id) const {
+    Node* node = peek_node(id);
+    if (node == nullptr) return SlotState::Empty;
+    return node->state.load(std::memory_order_acquire);
+  }
+
+  bool is_live(std::uint32_t id) const { return state_of(id) == SlotState::Live; }
+
+  bool occupies(std::uint32_t id) const {
+    const SlotState st = state_of(id);
+    return st == SlotState::Live || st == SlotState::Tombstone;
+  }
+
+  static bool contains_id(const std::vector<std::uint32_t>& v, std::uint32_t id) {
+    return std::find(v.begin(), v.end(), id) != v.end();
+  }
+
+  void add_in(std::uint32_t dst, int layer, std::uint32_t src) {
+    if (dst == src) return;
+    Node* node = peek_node(dst);
+    if (node == nullptr || layer < 0 || layer >= static_cast<int>(node->inbound.size())) return;
+    auto& in = node->inbound[static_cast<std::size_t>(layer)];
+    if (std::find(in.begin(), in.end(), src) == in.end()) in.push_back(src);
+  }
+
+  void remove_in(std::uint32_t dst, int layer, std::uint32_t src) {
+    if (dst == src) return;
+    Node* node = peek_node(dst);
+    if (node == nullptr || layer < 0 || layer >= static_cast<int>(node->inbound.size())) return;
+    auto& in = node->inbound[static_cast<std::size_t>(layer)];
+    in.erase(std::remove(in.begin(), in.end(), src), in.end());
+  }
+
+  void write_links(std::uint32_t id, int layer, const std::vector<std::uint32_t>& neu) {
+    Node* node = node_ptr(id);
+    std::lock_guard<std::mutex> lock(node->mu);
+    if (layer < 0 || layer > node->level) return;
+    const std::vector<std::uint32_t> old = snapshot_locked(*node, layer);
+    publish_locked(*node, layer, neu.data(), static_cast<std::uint32_t>(neu.size()));
+    for (std::uint32_t x : old) {
+      if (!contains_id(neu, x)) remove_in(x, layer, id);
+    }
+    for (std::uint32_t x : neu) {
+      if (!contains_id(old, x)) add_in(x, layer, id);
+    }
+  }
+
+  std::atomic<std::uint64_t>* pin_slot() const {
+    static thread_local int index = -1;
+    if (index < 0) {
+      const int claimed = pin_used_.fetch_add(1, std::memory_order_relaxed);
+      if (claimed >= kMaxPins) throw std::logic_error("hnsw: too many search threads");
+      index = claimed;
+    }
+    return &pins_[index];
+  }
+
+  void try_reclaim_locked() {
+    std::uint64_t min_pin = std::numeric_limits<std::uint64_t>::max();
+    bool any = false;
+    int used = pin_used_.load(std::memory_order_acquire);
+    if (used > kMaxPins) used = kMaxPins;
+    for (int i = 0; i < used; ++i) {
+      const std::uint64_t p = pins_[i].load(std::memory_order_acquire);
+      if (p == 0) continue;
+      any = true;
+      if (p < min_pin) min_pin = p;
+    }
+    if (!any) min_pin = std::numeric_limits<std::uint64_t>::max();
+    std::size_t keep = 0;
+    for (const Retired& item : retired_) {
+      if (item.epoch < min_pin) {
+        freelist_.push_back(item.id);
+      } else {
+        retired_[keep++] = item;
+      }
+    }
+    retired_.resize(keep);
+  }
+
+  void retire(std::uint32_t id) {
+    std::lock_guard<std::mutex> lock(reclaim_mu_);
+    const std::uint64_t epoch = epoch_clock_.load(std::memory_order_relaxed);
+    retired_.push_back(Retired{id, epoch});
+    epoch_clock_.fetch_add(1, std::memory_order_release);
+    try_reclaim_locked();
+  }
+
+  std::uint32_t find_occupant(int level, const std::vector<std::uint32_t>& prefer) const {
+    for (std::uint32_t id : prefer) {
+      Node* node = peek_node(id);
+      if (node != nullptr && occupies(id) && node->level == level) return id;
+    }
+    const std::uint32_t hwm = n_.load(std::memory_order_relaxed);
+    for (std::uint32_t id = 0; id < hwm; ++id) {
+      Node* node = peek_node(id);
+      if (node != nullptr && occupies(id) && node->level == level) return id;
+    }
+    return std::numeric_limits<std::uint32_t>::max();
   }
 
   // Caller holds node.mu, or is the only thread that can observe the node.
@@ -493,7 +646,8 @@ struct Index::Impl {
     selected.reserve(std::min(max_keep, cand.size()));
     for (const Neighbor& c : cand) {
       if (selected.size() >= max_keep) break;
-      if (c.id == self) continue;
+      if (c.id == self || !is_live(c.id)) continue;
+      if (std::find(selected.begin(), selected.end(), c.id) != selected.end()) continue;
       bool good = true;
       const float* cv = vector_ptr(c.id);
       for (std::uint32_t s : selected) {
@@ -527,8 +681,16 @@ struct Index::Impl {
     auto consider = [&](std::uint32_t id) {
       if (id >= tls.tags.size()) tls.tags.resize(static_cast<std::size_t>(id) + 1, 0);
       if (tls.tags[id] == token) return;
+      const SlotState st = state_of(id);
+      if (st != SlotState::Live && st != SlotState::Tombstone) return;
       tls.tags[id] = token;
       const float d = dist_(q, vector_ptr(id), dim_);
+      // A tombstone stays on the candidate heap so its edges are expanded,
+      // and it does not enter the result beam.
+      if (st == SlotState::Tombstone) {
+        cand.push(Candidate{d, id});
+        return;
+      }
       if (result.size() < ef || improves(d, id, result.top())) {
         cand.push(Candidate{d, id});
         result.push(Candidate{d, id});
@@ -540,12 +702,14 @@ struct Index::Impl {
     while (!cand.empty()) {
       const Candidate c = cand.top();
       cand.pop();
-      if (result.size() >= ef && c.dist > result.top().dist) break;
+      if (!result.empty() && result.size() >= ef && c.dist > result.top().dist) break;
       Node* node = node_ptr(c.id);
       if (layer > node->level) continue;
       read_links(*node, layer, tls.neigh);
       for (std::size_t i = 0; i < tls.neigh.size(); ++i) {
-        if (i + 1 < tls.neigh.size()) prefetch_range(vector_ptr(tls.neigh[i + 1]), bytes);
+        if (i + 1 < tls.neigh.size() && occupies(tls.neigh[i + 1])) {
+          prefetch_range(vector_ptr(tls.neigh[i + 1]), bytes);
+        }
         consider(tls.neigh[i]);
       }
     }
@@ -558,53 +722,51 @@ struct Index::Impl {
   }
 
   void add_reverse(std::uint32_t eid, int layer, std::uint32_t q, std::size_t maxm) {
-    Node* e = node_ptr(eid);
-    std::lock_guard<std::mutex> lock(e->mu);
-    std::vector<std::uint32_t> cur = snapshot_locked(*e, layer);
-    for (std::uint32_t x : cur) {
-      if (x == q) return;
-    }
+    if (!is_live(eid) || !is_live(q)) return;
+    std::vector<std::uint32_t> cur;
+    read_links(*node_ptr(eid), layer, cur);
+    if (contains_id(cur, q)) return;
     cur.push_back(q);
     if (cur.size() > maxm) {
       const float* origin = vector_ptr(eid);
       std::vector<Neighbor> cand;
       cand.reserve(cur.size());
       for (std::uint32_t x : cur) {
-        if (x == eid) continue;
+        if (x == eid || !is_live(x)) continue;
         cand.push_back(Neighbor{x, dist_(origin, vector_ptr(x), dim_)});
       }
-      const std::vector<std::uint32_t> sel = select_from(std::move(cand), maxm, eid);
-      publish_locked(*e, layer, sel.data(), static_cast<std::uint32_t>(sel.size()));
-      return;
+      cur = select_from(std::move(cand), maxm, eid);
     }
-    publish_locked(*e, layer, cur.data(), static_cast<std::uint32_t>(cur.size()));
+    write_links(eid, layer, cur);
   }
 
-  void link_node(std::uint32_t id, Node* node, const float* vec) {
-    const int level = node->level;
+  void link_node(std::uint32_t id, std::uint32_t gen, const float* vec) {
+    std::lock_guard<std::mutex> graph(graph_mu_);
+    Node* node = peek_node(id);
+    if (node == nullptr || node->gen.load(std::memory_order_relaxed) != gen) return;
+    if (node->state.load(std::memory_order_relaxed) != SlotState::Live) return;
     while (!ready_.load(std::memory_order_acquire)) std::this_thread::yield();
 
+    const int level = node->level;
     const int top = max_level_.load(std::memory_order_acquire);
-    std::uint32_t ep = entry_.load(std::memory_order_relaxed);
+    std::uint32_t ep = entry_.load(std::memory_order_acquire);
     for (int lc = top; lc > level; --lc) {
       const std::vector<Neighbor> found = search_layer(vec, ep, 1, lc);
-      ep = found.front().id;
+      if (!found.empty()) ep = found.front().id;
     }
     const int limit = std::min(level, top);
     for (int lc = limit; lc >= 0; --lc) {
       const std::vector<Neighbor> found = search_layer(vec, ep, ef_construction_, lc);
       const std::vector<std::uint32_t> sel = select_from(found, max_m(lc), id);
-      {
-        std::lock_guard<std::mutex> lock(node->mu);
-        publish_locked(*node, lc, sel.data(), static_cast<std::uint32_t>(sel.size()));
-      }
+      write_links(id, lc, sel);
       for (std::uint32_t e : sel) {
         if (e == id) continue;
         add_reverse(e, lc, id, max_m(lc));
       }
-      ep = found.front().id;
+      if (!found.empty()) ep = found.front().id;
     }
 
+    if (node->gen.load(std::memory_order_relaxed) != gen) return;
     if (level > max_level_.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lock(entry_mu_);
       if (level > max_level_.load(std::memory_order_relaxed)) {
@@ -617,27 +779,45 @@ struct Index::Impl {
   std::uint32_t insert(const float* vector) {
     if (vector == nullptr) throw std::invalid_argument("hnsw: null vector");
     std::unique_lock<std::mutex> alloc(alloc_mu_);
-    const std::uint32_t id = n_.load(std::memory_order_relaxed);
+    bool reused = false;
+    std::uint32_t id = 0;
+    {
+      std::lock_guard<std::mutex> reclaim(reclaim_mu_);
+      try_reclaim_locked();
+      if (!freelist_.empty()) {
+        id = freelist_.back();
+        freelist_.pop_back();
+        reused = true;
+      } else {
+        id = n_.load(std::memory_order_relaxed);
+      }
+    }
+    const bool first = max_level_.load(std::memory_order_relaxed) < 0;
     ensure_storage(id);
-    float* dst = vector_ptr_unlocked(id);
-    std::memcpy(dst, vector, dim_ * sizeof(float));
-    if (params_.metric == Metric::Cosine) l2_normalize(dst, dim_);
     VecChunk* chunk = vec_table_.load(std::memory_order_relaxed)
                           ->slots[id >> kChunkShift]
                           .load(std::memory_order_relaxed);
+    if (reused) chunk->ready[id & kChunkMask].store(0, std::memory_order_release);
+    float* dst = vector_ptr_unlocked(id);
+    std::memcpy(dst, vector, dim_ * sizeof(float));
+    if (params_.metric == Metric::Cosine) l2_normalize(dst, dim_);
     chunk->ready[id & kChunkMask].store(1, std::memory_order_release);
     const int level = level_for(id);
-    Node* node = init_node(id, level);
+    const std::uint32_t gen = adopt_slot(id, level);
+    Node* node = node_at(id);
+    node->state.store(SlotState::Live, std::memory_order_release);
     node_table_.load(std::memory_order_relaxed)->slots[id].store(node, std::memory_order_release);
-    if (id == 0) {
-      entry_.store(0, std::memory_order_relaxed);
+    level_count_[level].fetch_add(1, std::memory_order_relaxed);
+    live_.fetch_add(1, std::memory_order_release);
+    if (!reused) n_.store(id + 1, std::memory_order_release);
+    if (first) {
+      entry_.store(id, std::memory_order_relaxed);
       max_level_.store(level, std::memory_order_relaxed);
-      ready_.store(true, std::memory_order_relaxed);
+      ready_.store(true, std::memory_order_release);
     }
-    n_.store(id + 1, std::memory_order_release);
     alloc.unlock();
-    if (id == 0) return 0;
-    link_node(id, node, dst);
+    if (first) return id;
+    link_node(id, gen, dst);
     return id;
   }
 
@@ -668,11 +848,29 @@ struct Index::Impl {
     if (k == 0) return {};
     if (query == nullptr) throw std::invalid_argument("hnsw: null query");
     if (k > 10000000 || ef > 10000000) throw std::invalid_argument("hnsw: ef/k too large");
-    const std::uint32_t n = n_.load(std::memory_order_acquire);
-    if (n == 0) return {};
-    if (k > n) k = n;
+    // Publish the sampled epoch, then confirm the clock did not move. A
+    // reclaim that ran between the load and the store bumps the clock, so
+    // the retry observes it. Epoch 0 means the pin is inactive.
+    struct Pin {
+      std::atomic<std::uint64_t>* slot = nullptr;
+      Pin(std::atomic<std::uint64_t>* s, const std::atomic<std::uint64_t>& clock) : slot(s) {
+        for (;;) {
+          const std::uint64_t epoch = clock.load(std::memory_order_acquire);
+          slot->store(epoch, std::memory_order_release);
+          if (clock.load(std::memory_order_acquire) == epoch) break;
+        }
+      }
+      ~Pin() { slot->store(0, std::memory_order_release); }
+      Pin(const Pin&) = delete;
+      Pin& operator=(const Pin&) = delete;
+    };
+    Pin pin(pin_slot(), epoch_clock_);
+
+    const std::uint32_t live = live_.load(std::memory_order_acquire);
+    if (live == 0 || max_level_.load(std::memory_order_acquire) < 0) return {};
+    if (k > live) k = live;
     std::size_t beam = std::max(ef, k);
-    if (beam > n) beam = n;
+    if (beam > live) beam = live;
     if (beam == 0) return {};
 
     const float* q = query;
@@ -685,74 +883,211 @@ struct Index::Impl {
     }
 
     const int top = max_level_.load(std::memory_order_acquire);
-    std::uint32_t ep = entry_.load(std::memory_order_relaxed);
+    std::uint32_t ep = entry_.load(std::memory_order_acquire);
     for (int lc = top; lc > 0; --lc) {
       const std::vector<Neighbor> found = search_layer(q, ep, 1, lc);
-      ep = found.front().id;
+      if (!found.empty()) ep = found.front().id;
     }
     std::vector<Neighbor> found = search_layer(q, ep, beam, 0);
-    if (found.size() > k) found.resize(k);
-    return found;
+    std::vector<Neighbor> kept;
+    kept.reserve(std::min(found.size(), k));
+    for (const Neighbor& hit : found) {
+      if (!is_live(hit.id)) continue;
+      kept.push_back(hit);
+      if (kept.size() == k) break;
+    }
+    return kept;
+  }
+
+  void tombstone(std::uint32_t id) {
+    std::lock_guard<std::mutex> graph(graph_mu_);
+    if (id >= n_.load(std::memory_order_relaxed)) throw std::out_of_range("hnsw: id");
+    Node* node = peek_node(id);
+    if (node == nullptr || node->state.load(std::memory_order_relaxed) != SlotState::Live) {
+      throw std::out_of_range("hnsw: id");
+    }
+    node->state.store(SlotState::Tombstone, std::memory_order_release);
+    live_.fetch_sub(1, std::memory_order_release);
+  }
+
+  void erase(std::uint32_t id) {
+    std::uint32_t retired_id = 0;
+    bool do_retire = false;
+    {
+      std::lock_guard<std::mutex> graph(graph_mu_);
+      if (id >= n_.load(std::memory_order_relaxed)) throw std::out_of_range("hnsw: id");
+      Node* node = peek_node(id);
+      if (node == nullptr) throw std::out_of_range("hnsw: id");
+      const SlotState st = node->state.load(std::memory_order_relaxed);
+      if (st != SlotState::Live && st != SlotState::Tombstone) throw std::out_of_range("hnsw: id");
+      const int level = node->level;
+      std::vector<std::vector<std::uint32_t>> outs(static_cast<std::size_t>(level) + 1);
+      std::vector<std::vector<std::uint32_t>> ins(static_cast<std::size_t>(level) + 1);
+      for (int layer = 0; layer <= level; ++layer) {
+        read_links(*node, layer, outs[static_cast<std::size_t>(layer)]);
+        ins[static_cast<std::size_t>(layer)] = node->inbound[static_cast<std::size_t>(layer)];
+      }
+      node->gen.fetch_add(1, std::memory_order_relaxed);
+      node->state.store(SlotState::Free, std::memory_order_release);
+      if (st == SlotState::Live) live_.fetch_sub(1, std::memory_order_acq_rel);
+      level_count_[level].fetch_sub(1, std::memory_order_acq_rel);
+
+      for (int layer = level; layer >= 0; --layer) {
+        write_links(id, layer, {});
+        for (std::uint32_t u : ins[static_cast<std::size_t>(layer)]) {
+          if (u == id) continue;
+          Node* un = peek_node(u);
+          if (un == nullptr || layer > un->level) continue;
+          std::vector<std::uint32_t> cur;
+          read_links(*un, layer, cur);
+          const auto it = std::find(cur.begin(), cur.end(), id);
+          if (it == cur.end()) continue;
+          cur.erase(it);
+          if (un->state.load(std::memory_order_relaxed) != SlotState::Live) {
+            write_links(u, layer, cur);
+            continue;
+          }
+          const float* origin = vector_ptr(u);
+          std::vector<Neighbor> cand;
+          auto push = [&](std::uint32_t other) {
+            if (other == u || other == id || !is_live(other)) return;
+            cand.push_back(Neighbor{other, dist_(origin, vector_ptr(other), dim_)});
+          };
+          for (std::uint32_t x : cur) push(x);
+          for (std::uint32_t x : outs[static_cast<std::size_t>(layer)]) push(x);
+          for (std::uint32_t x : ins[static_cast<std::size_t>(layer)]) push(x);
+          const std::vector<Neighbor> found = search_layer(origin, u, ef_construction_, layer);
+          for (const Neighbor& hit : found) push(hit.id);
+          const std::vector<std::uint32_t> sel = select_from(std::move(cand), max_m(layer), u);
+          write_links(u, layer, sel);
+        }
+      }
+      for (auto& in : node->inbound) in.clear();
+
+      int top = kMaxLevel;
+      while (top >= 0 && level_count_[top].load(std::memory_order_relaxed) == 0) --top;
+      if (top < 0) {
+        max_level_.store(-1, std::memory_order_relaxed);
+        entry_.store(0, std::memory_order_relaxed);
+        ready_.store(false, std::memory_order_release);
+      } else {
+        std::uint32_t ep = entry_.load(std::memory_order_relaxed);
+        Node* en = peek_node(ep);
+        const bool entry_ok = en != nullptr && occupies(ep) && en->level == top;
+        if (!entry_ok) {
+          std::vector<std::uint32_t> prefer;
+          for (int layer = level; layer >= 0; --layer) {
+            prefer.insert(prefer.end(), outs[static_cast<std::size_t>(layer)].begin(),
+                          outs[static_cast<std::size_t>(layer)].end());
+            prefer.insert(prefer.end(), ins[static_cast<std::size_t>(layer)].begin(),
+                          ins[static_cast<std::size_t>(layer)].end());
+          }
+          ep = find_occupant(top, prefer);
+          if (ep == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::logic_error("hnsw: missing entry");
+          }
+        }
+        entry_.store(ep, std::memory_order_relaxed);
+        max_level_.store(top, std::memory_order_release);
+        ready_.store(true, std::memory_order_release);
+      }
+      retired_id = id;
+      do_retire = true;
+    }
+    if (do_retire) retire(retired_id);
   }
 
   void copy_vector(std::uint32_t id, float* out) const {
     if (out == nullptr) throw std::invalid_argument("hnsw: null output");
-    if (id >= n_.load(std::memory_order_acquire)) throw std::out_of_range("hnsw: id");
+    if (!occupies(id)) throw std::out_of_range("hnsw: id");
     std::memcpy(out, vector_ptr(id), dim_ * sizeof(float));
   }
 
   int level_of(std::uint32_t id) const {
-    if (id >= n_.load(std::memory_order_acquire)) throw std::out_of_range("hnsw: id");
-    return node_ptr(id)->level;
+    if (!occupies(id)) throw std::out_of_range("hnsw: id");
+    return peek_node(id)->level;
   }
 
   std::vector<std::uint32_t> neighbors_of(std::uint32_t id, int layer) const {
-    if (id >= n_.load(std::memory_order_acquire)) throw std::out_of_range("hnsw: id");
-    Node* node = node_ptr(id);
+    if (!occupies(id)) throw std::out_of_range("hnsw: id");
+    Node* node = peek_node(id);
     if (layer < 0 || layer > node->level) throw std::out_of_range("hnsw: layer");
     std::vector<std::uint32_t> out;
     read_links(*node, layer, out);
     return out;
   }
 
+  std::size_t memory_bytes() const {
+    std::size_t bytes = 0;
+    bytes +=
+        chunks_.size() * (static_cast<std::size_t>(kChunkSize) * dim_ * sizeof(float) + kChunkSize);
+    bytes += arena_.bytes();
+    bytes += blocks_.size() * sizeof(NodeBlock);
+    for (const auto& table : node_tables_) bytes += table->cap * sizeof(Node*);
+    for (const auto& table : vec_tables_) bytes += table->cap * sizeof(VecChunk*);
+    const std::uint32_t hwm = n_.load(std::memory_order_acquire);
+    for (std::uint32_t id = 0; id < hwm; ++id) {
+      Node* node = peek_node(id);
+      if (node == nullptr) continue;
+      for (const auto& in : node->inbound) bytes += in.capacity() * sizeof(std::uint32_t);
+    }
+    return bytes;
+  }
+
+  void write_vec(std::ostream& out, const float* v, bool bulk) const {
+    if (bulk) {
+      out.write(reinterpret_cast<const char*>(v),
+                static_cast<std::streamsize>(dim_ * sizeof(float)));
+    } else {
+      for (std::size_t i = 0; i < dim_; ++i) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, v + i, 4);
+        write_u32(out, bits);
+      }
+    }
+  }
+
   void save(const std::filesystem::path& path) const {
     std::ofstream out(path, std::ios::binary);
     if (!out) throw std::runtime_error("hnsw: cannot open " + path.string());
     const bool bulk = host_little_endian();
-    const std::uint32_t n = n_.load(std::memory_order_acquire);
+    const std::uint32_t hwm = n_.load(std::memory_order_acquire);
     const int max_level = max_level_.load(std::memory_order_acquire);
-    const std::uint32_t entry = entry_.load(std::memory_order_relaxed);
+    const std::uint32_t entry = entry_.load(std::memory_order_acquire);
+    std::vector<std::uint8_t> flags(hwm, 0);
+    std::vector<std::uint32_t> ids;
+    ids.reserve(hwm);
+    for (std::uint32_t id = 0; id < hwm; ++id) {
+      const SlotState st = state_of(id);
+      if (st == SlotState::Live) {
+        flags[id] = 1;
+        ids.push_back(id);
+      } else if (st == SlotState::Tombstone) {
+        flags[id] = 2;
+        ids.push_back(id);
+      }
+    }
 
     out.write(kMagic, 8);
-    write_u32(out, kVersion);
+    write_u32(out, kVersionSlots);
     write_u32(out, static_cast<std::uint32_t>(dim_));
     write_u32(out, static_cast<std::uint32_t>(params_.metric));
     write_u32(out, static_cast<std::uint32_t>(M_));
     write_u32(out, static_cast<std::uint32_t>(M0_));
     write_u32(out, static_cast<std::uint32_t>(ef_construction_));
     write_u64(out, seed_);
-    write_u32(out, n);
+    write_u32(out, hwm);
     write_i32(out, max_level);
     write_u32(out, entry);
-
-    for (std::uint32_t id = 0; id < n; ++id) {
-      const float* v = vector_ptr(id);
-      if (bulk) {
-        out.write(reinterpret_cast<const char*>(v),
-                  static_cast<std::streamsize>(dim_ * sizeof(float)));
-      } else {
-        for (std::size_t i = 0; i < dim_; ++i) {
-          std::uint32_t bits = 0;
-          std::memcpy(&bits, v + i, 4);
-          write_u32(out, bits);
-        }
-      }
+    if (!flags.empty()) {
+      out.write(reinterpret_cast<const char*>(flags.data()),
+                static_cast<std::streamsize>(flags.size()));
     }
-    for (std::uint32_t id = 0; id < n; ++id)
-      write_u32(out, static_cast<std::uint32_t>(level_of(id)));
+    for (std::uint32_t id : ids) write_vec(out, vector_ptr(id), bulk);
+    for (std::uint32_t id : ids) write_u32(out, static_cast<std::uint32_t>(level_of(id)));
     std::vector<std::uint32_t> links;
-    for (std::uint32_t id = 0; id < n; ++id) {
-      Node* node = node_ptr(id);
+    for (std::uint32_t id : ids) {
+      Node* node = peek_node(id);
       for (int layer = 0; layer <= node->level; ++layer) {
         read_links(*node, layer, links);
         write_u32(out, static_cast<std::uint32_t>(links.size()));
@@ -760,6 +1095,20 @@ struct Index::Impl {
       }
     }
     if (!out) throw std::runtime_error("hnsw: write failed " + path.string());
+  }
+
+  static void read_vec(std::istream& in, float* dst, std::size_t dim, bool bulk) {
+    if (bulk) {
+      in.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(dim * sizeof(float)));
+      if (static_cast<std::size_t>(in.gcount()) != dim * sizeof(float)) {
+        throw std::runtime_error("hnsw: truncated vectors");
+      }
+      return;
+    }
+    for (std::size_t i = 0; i < dim; ++i) {
+      const std::uint32_t bits = read_u32(in);
+      std::memcpy(dst + i, &bits, 4);
+    }
   }
 
   static std::unique_ptr<Impl> load(const std::filesystem::path& path) {
@@ -771,7 +1120,9 @@ struct Index::Impl {
       throw std::runtime_error("hnsw: bad magic");
     }
     const std::uint32_t version = read_u32(in);
-    if (version != kVersion) throw std::runtime_error("hnsw: unsupported version");
+    if (version != kVersionDense && version != kVersionSlots) {
+      throw std::runtime_error("hnsw: unsupported version");
+    }
     const auto dim = static_cast<std::size_t>(read_u32(in));
     const auto metric = static_cast<Metric>(read_u32(in));
     Params params;
@@ -780,75 +1131,95 @@ struct Index::Impl {
     params.ef_construction = read_u32(in);
     params.seed = read_u64(in);
     params.metric = metric;
-    const std::uint32_t n = read_u32(in);
+    const std::uint32_t count_or_hwm = read_u32(in);
     const int max_level = read_i32(in);
     const std::uint32_t entry = read_u32(in);
 
     auto impl = std::make_unique<Impl>(dim, params);
     if (M0 != impl->M0_) throw std::runtime_error("hnsw: M0 does not match 2M");
-    if (n == 0) {
+
+    std::vector<std::uint8_t> flags;
+    std::uint32_t hwm = count_or_hwm;
+    if (version == kVersionDense) {
+      flags.assign(hwm, 1);
+    } else {
+      flags.resize(hwm);
+      if (hwm > 0) {
+        in.read(reinterpret_cast<char*>(flags.data()), static_cast<std::streamsize>(hwm));
+        if (static_cast<std::size_t>(in.gcount()) != hwm)
+          throw std::runtime_error("hnsw: truncated flags");
+      }
+    }
+    std::vector<std::uint32_t> ids;
+    for (std::uint32_t id = 0; id < hwm; ++id) {
+      if (flags[id] == 1 || flags[id] == 2)
+        ids.push_back(id);
+      else if (flags[id] != 0)
+        throw std::runtime_error("hnsw: bad slot flag");
+      else
+        impl->freelist_.push_back(id);
+    }
+    if (ids.empty()) {
       if (max_level != -1 || entry != 0) throw std::runtime_error("hnsw: empty index header");
+      impl->n_.store(hwm, std::memory_order_release);
       return impl;
     }
-    if (entry >= n) throw std::runtime_error("hnsw: entry point out of range");
+    if (entry >= hwm) throw std::runtime_error("hnsw: entry point out of range");
 
     const bool bulk = host_little_endian();
-    for (std::uint32_t id = 0; id < n; ++id) {
+    for (std::uint32_t id : ids) {
       impl->ensure_storage(id);
       float* dst = impl->vector_ptr_unlocked(id);
-      if (bulk) {
-        in.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(dim * sizeof(float)));
-        if (static_cast<std::size_t>(in.gcount()) != dim * sizeof(float)) {
-          throw std::runtime_error("hnsw: truncated vectors");
-        }
-      } else {
-        for (std::size_t i = 0; i < dim; ++i) {
-          const std::uint32_t bits = read_u32(in);
-          std::memcpy(dst + i, &bits, 4);
-        }
-      }
+      read_vec(in, dst, dim, bulk);
       VecChunk* chunk = impl->vec_table_.load(std::memory_order_relaxed)
                             ->slots[id >> kChunkShift]
                             .load(std::memory_order_relaxed);
       chunk->ready[id & kChunkMask].store(1, std::memory_order_release);
     }
 
-    std::vector<int> levels(n);
+    std::vector<int> levels(hwm, -1);
     int observed = -1;
-    for (std::uint32_t id = 0; id < n; ++id) {
+    for (std::uint32_t id : ids) {
       const int level = static_cast<int>(read_u32(in));
-      if (level < 0 || level > 64) throw std::runtime_error("hnsw: bad level");
+      if (level < 0 || level > kMaxLevel) throw std::runtime_error("hnsw: bad level");
       levels[id] = level;
       observed = std::max(observed, level);
     }
     if (observed != max_level) throw std::runtime_error("hnsw: max_level mismatch");
     if (levels[entry] != max_level) throw std::runtime_error("hnsw: entry level mismatch");
 
-    for (std::uint32_t id = 0; id < n; ++id) {
-      Node* node = impl->init_node(id, levels[id]);
+    std::uint32_t live = 0;
+    for (std::uint32_t id : ids) {
+      const SlotState st = flags[id] == 1 ? SlotState::Live : SlotState::Tombstone;
+      impl->adopt_slot(id, levels[id]);
+      Node* node = impl->node_at(id);
+      node->state.store(st, std::memory_order_release);
       impl->node_table_.load(std::memory_order_relaxed)
           ->slots[id]
           .store(node, std::memory_order_release);
+      impl->level_count_[levels[id]].fetch_add(1, std::memory_order_relaxed);
+      if (st == SlotState::Live) ++live;
     }
+    impl->n_.store(hwm, std::memory_order_release);
 
-    for (std::uint32_t id = 0; id < n; ++id) {
-      Node* node = impl->node_ptr(id);
+    for (std::uint32_t id : ids) {
       for (int layer = 0; layer <= levels[id]; ++layer) {
         const std::uint32_t degree = read_u32(in);
         if (degree > impl->max_m(layer)) throw std::runtime_error("hnsw: degree exceeds cap");
         std::vector<std::uint32_t> links(degree);
         for (std::uint32_t i = 0; i < degree; ++i) {
           links[i] = read_u32(in);
-          if (links[i] >= n || links[i] == id) throw std::runtime_error("hnsw: bad neighbor");
+          if (links[i] >= hwm || links[i] == id) throw std::runtime_error("hnsw: bad neighbor");
+          if (levels[links[i]] < layer) throw std::runtime_error("hnsw: neighbor level");
         }
-        impl->publish_locked(*node, layer, links.data(), degree);
+        impl->write_links(id, layer, links);
       }
     }
 
+    impl->live_.store(live, std::memory_order_release);
     impl->entry_.store(entry, std::memory_order_relaxed);
     impl->max_level_.store(max_level, std::memory_order_relaxed);
-    impl->ready_.store(true, std::memory_order_relaxed);
-    impl->n_.store(n, std::memory_order_release);
+    impl->ready_.store(true, std::memory_order_release);
     return impl;
   }
 };
@@ -866,7 +1237,16 @@ std::size_t Index::dim() const {
   return impl_->dim_;
 }
 std::size_t Index::size() const {
+  return impl_->live_.load(std::memory_order_acquire);
+}
+std::size_t Index::slot_count() const {
   return impl_->n_.load(std::memory_order_acquire);
+}
+std::size_t Index::memory_bytes() const {
+  return impl_->memory_bytes();
+}
+bool Index::contains(std::uint32_t id) const {
+  return impl_->is_live(id);
 }
 std::size_t Index::M() const {
   return impl_->M_;
@@ -897,6 +1277,12 @@ std::uint32_t Index::insert(const float* vector) {
 }
 void Index::insert_batch(const float* vectors, std::size_t count, std::size_t threads) {
   impl_->insert_batch(vectors, count, threads);
+}
+void Index::erase(std::uint32_t id) {
+  impl_->erase(id);
+}
+void Index::tombstone(std::uint32_t id) {
+  impl_->tombstone(id);
 }
 std::vector<Neighbor> Index::search(const float* query, std::size_t k, std::size_t ef) const {
   return impl_->search(query, k, ef);

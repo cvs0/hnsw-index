@@ -50,10 +50,11 @@ inline double recall_at_k(const std::vector<std::vector<Neighbor>>& results,
 }
 
 // Multi-layer proximity graph.
-// Layer 0 holds every point and at most M0 = 2M neighbors.
-// Layer l > 0 holds points with level >= l and at most M neighbors.
-// Insert is safe concurrently with insert and search.
-// save, load, and destruction require exclusive access.
+// Layer 0 holds every live point and every tombstone, at most M0 = 2M neighbors.
+// Layer l > 0 holds occupants with level >= l and at most M neighbors.
+// Insert linking and erase take an exclusive graph mutex. Search does not.
+// A freed slot is not reused until every search that started before the
+// unlink has finished. save, load, and destruction require exclusive access.
 class Index {
  public:
   explicit Index(std::size_t dim, Params params = {});
@@ -64,14 +65,21 @@ class Index {
   ~Index();
 
   std::size_t dim() const;
+  // Live points. Tombstones and free slots are excluded.
   std::size_t size() const;
+  // High-water slot count. Ids issued so far are in `[0, slot_count())`.
+  std::size_t slot_count() const;
+  // Bytes retained for vectors, neighbor atoms, inbound lists, and node blocks.
+  std::size_t memory_bytes() const;
   std::size_t M() const;
   std::size_t M0() const;
   const Params& params() const;
-  // -1 when empty.
+  // -1 when no live point and no tombstone remains.
   int max_level() const;
-  // Meaningful when size() > 0.
+  // Meaningful when max_level() >= 0. The entry may be a tombstone.
   std::uint32_t entry_point() const;
+  // True only for a live point.
+  bool contains(std::uint32_t id) const;
   int level(std::uint32_t id) const;
   std::vector<std::uint32_t> neighbors(std::uint32_t id, int layer) const;
   void copy_vector(std::uint32_t id, float* out) const;
@@ -82,6 +90,14 @@ class Index {
   // `threads == 1` assigns ids in row order. Concurrent calls allocate ids as
   // they take the allocator lock, so ids are not row order.
   void insert_batch(const float* vectors, std::size_t count, std::size_t threads = 1);
+
+  // Unlink `id` at every layer, repair in-neighbors, reuse the slot.
+  // Throws if `id` is not live and not tombstoned.
+  void erase(std::uint32_t id);
+
+  // Leave the vector and the edges in place. Search skips the id.
+  // The slot is not reused. Throws if `id` is not live.
+  void tombstone(std::uint32_t id);
 
   // Layer-0 beam is max(ef, k). Upper layers use beam 1.
   // Results are sorted by increasing distance, then increasing id. At most k.
@@ -113,6 +129,8 @@ class BruteForce {
 
   [[nodiscard]] std::uint32_t add(const float* vector);
   void add_batch(const float* vectors, std::size_t count);
+  // Marks the id dead and keeps its slot so later ids do not move.
+  void erase(std::uint32_t id);
   // Sorted by increasing distance, then increasing id.
   [[nodiscard]] std::vector<Neighbor> search(const float* query, std::size_t k) const;
 

@@ -1,0 +1,14 @@
+cpu_model Intel(R) Xeon(R) Processor
+MemTotal:       16387280 kB
+compiler 13.3.0
+avx2 1
+n 20000
+nq 1000
+dim 128
+M 16
+ef_construction 200
+k 10
+churn 0.1
+seed 1
+threads 1
+warmup one full untimed pass per ef, then one timed pass

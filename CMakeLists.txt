@@ -81,6 +81,9 @@ if(HNSW_BUILD_BENCH)
   add_executable(hnsw_bench bench/bench.cpp)
   target_link_libraries(hnsw_bench PRIVATE hnsw)
   target_compile_options(hnsw_bench PRIVATE -Wall -Wextra -Wpedantic)
+  add_executable(hnsw_delete_bench bench/delete_bench.cpp)
+  target_link_libraries(hnsw_delete_bench PRIVATE hnsw)
+  target_compile_options(hnsw_delete_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(HNSW_BUILD_TESTS)
@@ -99,7 +102,8 @@ if(HNSW_BUILD_TESTS)
     tests/test_index.cpp
     tests/test_recall.cpp
     tests/test_io.cpp
-    tests/test_concurrent.cpp)
+    tests/test_concurrent.cpp
+    tests/test_delete.cpp)
   target_link_libraries(hnsw_tests PRIVATE hnsw GTest::gtest_main)
   target_compile_options(hnsw_tests PRIVATE -Wall -Wextra -Wpedantic)
   if(HNSW_WERROR)
