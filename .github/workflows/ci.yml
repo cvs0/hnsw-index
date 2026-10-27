@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+            build_type: Release
+            asan: OFF
+            ubsan: OFF
+            tsan: OFF
+          - cc: clang
+            cxx: clang++
+            build_type: Release
+            asan: OFF
+            ubsan: OFF
+            tsan: OFF
+          - cc: gcc
+            cxx: g++
+            build_type: Debug
+            asan: ON
+            ubsan: ON
+            tsan: OFF
+          - cc: clang
+            cxx: clang++
+            build_type: Debug
+            asan: ON
+            ubsan: ON
+            tsan: OFF
+          - cc: clang
+            cxx: clang++
+            build_type: RelWithDebInfo
+            asan: OFF
+            ubsan: OFF
+            tsan: ON
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DHNSW_ENABLE_ASAN=${{ matrix.asan }}
+          -DHNSW_ENABLE_UBSAN=${{ matrix.ubsan }}
+          -DHNSW_ENABLE_TSAN=${{ matrix.tsan }}
+          -DHNSW_WERROR=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

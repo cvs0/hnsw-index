@@ -1,0 +1,14 @@
+cpu_model Intel(R) Xeon(R) Processor
+MemTotal:       16387280 kB
+compiler 13.3.0
+avx2 1
+build_seconds 468.655
+n 1000000
+nq 10000
+dim 128
+M 16
+M0 32
+ef_construction 200
+threads 1
+max_level 5
+csv /workspace/bench/results/hnsw.csv

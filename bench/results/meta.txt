@@ -1,0 +1,19 @@
+cpu_model Intel(R) Xeon(R) Processor
+MemTotal:       16387280 kB
+platform Linux-6.12.94+-x86_64-with-glibc2.39
+python 3.12.3
+faiss 1.15.1
+faiss_nb_neighbors_0 32
+faiss_nb_neighbors_1 16
+faiss_build_seconds 355.850378
+hnsw_build_seconds 468.655500
+n 1000000
+nq 10000
+dim 128
+M 16
+ef_construction 200
+k 10
+efs 10,20,40,80,160,320
+threads 1
+warmup one full untimed pass per ef, then one timed pass
+faiss omp threads 1
